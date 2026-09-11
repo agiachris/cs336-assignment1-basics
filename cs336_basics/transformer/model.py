@@ -38,9 +38,9 @@ def init_vec(
     return torch.ones(d_model, device=device, dtype=dtype)
 
 
-def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+def softmax(x: torch.Tensor, dim: int = -1, temp: float = 1.0) -> torch.Tensor:
     x = x - x.amax(dim=dim, keepdim=True)
-    exp = torch.exp(x)
+    exp = torch.exp(x / temp)
     return exp / exp.sum(dim=dim, keepdim=True)
 
 
@@ -459,6 +459,47 @@ class TransformerLLM(nn.Module):
 
         # Step 3. Output projection.
         return self.proj_out(z)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        token_ids: torch.LongTensor,
+        max_new_tokens: int,
+        context_size: int,
+        tau: float = 1.0,
+        nucleus: bool = False,
+        p: float = Optional[None]
+    ) -> torch.LongTensor:
+        """Return token indices for generated text."""
+        self.eval()
+        for _ in range(max_new_tokens):
+            # Step 1. Crop to context.
+            token_ids_cond = token_ids if token_ids.size(1) <= context_size else token_ids[:, -context_size:]
+
+            # Step 2. Compute logits.
+            logits_BV = self(token_ids_cond)[:, -1, :] / tau
+
+            # Step 2.5 Optional nucleas sampling.
+            if nucleus:
+                assert p is not None
+                sorted_logits_BV, sorted_idxs_BV = logits_BV.sort(dim=-1, descending=True)
+                sorted_probs_BV = softmax(sorted_logits_BV, dim=-1)
+                cum_BV = sorted_probs_BV.cumsum(dim=-1)
+
+                # Drop tokens whose *predecessors* already reached p.
+                drop_BV = cum_BV - sorted_probs_BV >= p          # first token always False
+                inv_BV = sorted_idxs_BV.argsort(dim=-1)
+                logits_BV = logits_BV.masked_fill(drop_BV.take_along_dim(inv_BV, dim=-1), float("-inf"))
+
+            # Step 2. Compute preds.
+            probs_BV = softmax(logits_BV, dim=-1)
+
+            # Step 3. Sample from distribution.
+            next_token_ids = torch.multinomial(probs_BV, num_samples=1)
+            # Step 4. Concatenate.
+            token_ids = torch.cat((token_ids, next_token_ids), dim=1)
+
+        return token_ids
 
 
 class SGD(torch.optim.Optimizer):
